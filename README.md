@@ -242,6 +242,37 @@ This branch is purpose-built for Codex users running inside WSL1 while Chrome st
 
 ---
 
+## Distributing to Your Dev Team
+
+Need everyone on the same branch/refactor without waiting for an npm publish? Ship a ready-to-run tarball and give your teammates two simple commands.
+
+### 1. Build and pack once
+```bash
+npm ci       # or npm install the first time
+npm run build
+npm pack     # creates notebooklm-mcp-<version>.tgz
+```
+The generated `.tgz` only contains files listed in `package.json` (`dist`, `docs`, etc.), so you can safely attach it to a GitHub release, drop it in internal storage, or upload it to a private npm feed.
+
+### 2. Teammates install from the artifact
+Share the tarball path or URL, then each developer runs:
+```bash
+npm install -g /path/to/notebooklm-mcp-<version>.tgz
+# or: npm install -g https://your.artifacts.server/notebooklm-mcp-<version>.tgz
+```
+After installation, they register the CLI just like the Quick Start (e.g., `codex mcp add notebooklm -- notebooklm-mcp`). Because the package embeds the compiled `dist/index.js`, everyone runs the exact bits you built.
+
+### 3. Optional: private registry workflow
+If you already operate an internal npm registry (Azure Artifacts, Verdaccio, Nexus, etc.), publish directly:
+```bash
+npm publish --registry https://registry.example.com
+```
+Pin the version in your docs (`npm install -g notebooklm-mcp@1.2.0`) so the team always pulls the vetted build. When you cut a new build, bump `package.json` and repeat the pack/publish step.
+
+> Tip: Include the tarball or registry link in your team's onboarding doc so new devs can get NotebookLM access without hunting for the repo.
+
+---
+
 ## Real-World Example
 
 ### Building an n8n Workflow Without Hallucinations
