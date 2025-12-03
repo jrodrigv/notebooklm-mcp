@@ -125,6 +125,8 @@ code --add-mcp '{"name":"notebooklm","command":"npx","args":["notebooklm-mcp@lat
 
 ---
 
+> ℹ️  The commands above install the published package. For this WSL1 refactor branch, follow the [WSL1 + Codex Setup Guide](#wsl1--codex-setup-guide) to register your locally built `dist/index.js` instead, ensuring Codex runs this exact code.
+
 ## Alternative: Claude Code Skill
 
 **Prefer Claude Code Skills over MCP?** This server is now also available as a native Claude Code Skill with a simpler setup:
@@ -141,7 +143,15 @@ Both use the same browser automation technology and provide zero-hallucination a
 
 ## Quick Start
 
-### 1. Install the MCP server (see [Installation](#installation) above)
+### 1. Install/build the MCP server locally
+
+Clone this repo inside WSL1 and run:
+```bash
+npm install
+npm run build
+codex mcp add notebooklm -- node /path/to/your/repo/dist/index.js
+```
+This registers your *local* build with Codex so it uses the WSL1-specific refactor instead of the published npm package.
 
 ### 2. Authenticate via Windows Chrome (one-time)
 
@@ -199,11 +209,18 @@ This branch is purpose-built for Codex users running inside WSL1 while Chrome st
   ```
   A JSON blob means Chrome exposed its DevTools endpoint correctly.
 
-#### 3. Register the MCP server with Codex (inside WSL1)
-```bash
-codex mcp add notebooklm -- npx notebooklm-mcp@latest
-```
-- Codex writes this config inside your Linux home directory; no Windows paths are touched.
+#### 3. Register your local build with Codex (inside WSL1)
+1. From the repo directory, run:
+   ```bash
+   npm install
+   npm run build
+   ```
+2. Point Codex at the compiled entry point:
+   ```bash
+   codex mcp add notebooklm -- node /absolute/path/to/this/repo/dist/index.js
+   ```
+   (If you prefer live reload while developing, you can use `codex mcp add notebooklm -- npx tsx watch src/index.ts`, but the `dist` bundle is recommended for stability.)
+- Codex stores this configuration under `~/.config/codex/mcp.json` inside WSL; Windows files remain untouched.
 
 #### 4. Authenticate NotebookLM
 1. Make sure the Windows Chrome window (launched with `--remote-debugging-port=9222`) is running.
