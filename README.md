@@ -143,13 +143,18 @@ Both use the same browser automation technology and provide zero-hallucination a
 
 ### 1. Install the MCP server (see [Installation](#installation) above)
 
-### 2. Authenticate (one-time)
+### 2. Authenticate via Windows Chrome (one-time)
 
-Say in your chat (Claude/Codex):
-```
-"Log me in to NotebookLM"
-```
-*A Chrome window opens → log in with Google*
+1. On the **Windows host**, launch Chrome with remote debugging enabled:
+   ```powershell
+   "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --remote-allow-origins=*
+   ```
+   (Any Chromium build works. Leave this window open; the MCP server will drive it.)
+2. Back inside **WSL1 Codex**, run the usual prompt:
+   ```
+   "Log me in to NotebookLM"
+   ```
+   The `setup_auth` tool opens a new tab in the Windows Chrome window. Complete Google login there; the MCP server waits until NotebookLM loads.
 
 ### 3. Create your knowledge base
 Go to [notebooklm.google.com](https://notebooklm.google.com) → Create notebook → Upload your docs:
@@ -166,6 +171,57 @@ Share: **⚙️ Share → Anyone with link → Copy**
 ```
 
 **That's it.** Claude now asks NotebookLM whatever it needs, building expertise before writing code.
+
+### WSL1 + Codex Setup Guide
+
+This branch is purpose-built for Codex users running inside WSL1 while Chrome stays on the Windows desktop. Follow these steps for a smooth installation.
+
+#### 1. Prepare the Windows host
+- Install Chrome (or Edge/Chromium).
+- Launch it with remote debugging enabled (PowerShell example):
+  ```powershell
+  $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+  & $chrome --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="$env:LOCALAPPDATA\NotebokLM-MCP-Profile"
+  ```
+  Leave this window open; the MCP server connects to it via CDP.
+- Optional: create a desktop shortcut/batch file so you can restart the “automation” Chrome quickly.
+
+#### 2. Configure networking + env vars in WSL1
+- WSL1 talks to Windows via `127.0.0.1`, so defaults typically just work. If you use Hyper-V or another VM, set the IP manually.
+- Add these to `~/.bashrc` (adjust host/port if needed):
+  ```bash
+  export REMOTE_CHROME_HOST=127.0.0.1
+  export REMOTE_CHROME_PORT=9222
+  ```
+- Verify reachability:
+  ```bash
+  curl http://$REMOTE_CHROME_HOST:$REMOTE_CHROME_PORT/json/version
+  ```
+  A JSON blob means Chrome exposed its DevTools endpoint correctly.
+
+#### 3. Register the MCP server with Codex (inside WSL1)
+```bash
+codex mcp add notebooklm -- npx notebooklm-mcp@latest
+```
+- Codex writes this config inside your Linux home directory; no Windows paths are touched.
+
+#### 4. Authenticate NotebookLM
+1. Make sure the Windows Chrome window (launched with `--remote-debugging-port=9222`) is running.
+2. In Codex, say “Log me in to NotebookLM” (or call `setup_auth` directly).
+3. Watch the Windows Chrome window: a new tab opens on accounts.google.com / notebooklm.google.com.
+4. Complete the Google login. When NotebookLM loads, the MCP server detects success and saves the session.
+5. Run `get_health` in Codex to confirm `remote_chrome.reachable=true` and `authenticated=true`.
+
+#### 5. Daily usage & tips
+- Keep the special Chrome window open; Codex sessions reuse it across terminal restarts.
+- Use `re_auth` whenever you hit rate limits or want to switch Google accounts (Chrome tab will log out and prompt again).
+- Use `cleanup_data(confirm=false, preserve_library=true)` if you want to preview/remove WSL cache files without touching the Windows Chrome profile.
+- If `get_health` reports `remote_chrome.reachable=false`, restart Chrome with the remote debugging flag and retry.
+
+#### Hyper-V / VM variant
+- Start Chrome inside the VM with `--remote-debugging-port=9222`.
+- Create a port-forward (e.g., `ssh -L 9222:localhost:9222 user@vm`) so WSL can reach it.
+- Set `REMOTE_CHROME_HOST=127.0.0.1` while the tunnel is active; everything else works the same.
 
 ---
 
@@ -279,7 +335,7 @@ Settings are saved to `~/.config/notebooklm-mcp/settings.json` and persist acros
 graph LR
     A[Your Task] --> B[Claude/Codex]
     B --> C[MCP Server]
-    C --> D[Chrome Automation]
+    C --> D[Remote Chrome (Windows)]
     D --> E[NotebookLM]
     E --> F[Gemini 2.5]
     F --> G[Your Docs]

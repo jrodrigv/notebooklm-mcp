@@ -15,8 +15,8 @@ Claude can control browser behavior via the `browser_options` parameter in tools
 
 ```typescript
 browser_options: {
-  show: boolean,              // Show browser window (overrides headless)
-  headless: boolean,          // Run in headless mode (default: true)
+  show: boolean,              // Legacy flag (ignored in remote mode)
+  headless: boolean,          // Legacy flag (ignored in remote mode)
   timeout_ms: number,         // Browser timeout in ms (default: 30000)
 
   stealth: {
@@ -37,8 +37,9 @@ browser_options: {
 }
 ```
 
+> ⚠️ In the WSL1 remote build, `show` and `headless` no longer affect visibility. Chrome always runs on Windows; these flags are only kept for backwards compatibility.
+
 **Example usage:**
-- "Research this and show me the browser" → Sets `show: true`
 - "Use slow typing for this query" → Adjusts typing WPM via stealth settings
 
 ---
@@ -46,10 +47,13 @@ browser_options: {
 ## Environment Variables (Optional)
 
 For advanced users who want to set global defaults:
-- Auth
-  - `AUTO_LOGIN_ENABLED` — `true|false` (default `false`)
-  - `LOGIN_EMAIL`, `LOGIN_PASSWORD` — for auto‑login if enabled
-  - `AUTO_LOGIN_TIMEOUT_MS` (default `120000`)
+- Remote Chrome (Windows / Hyper-V host)
+  - `REMOTE_CHROME_HOST` — host/IP of the Chrome instance (default `127.0.0.1` for WSL1)
+  - `REMOTE_CHROME_PORT` — remote debugging port (default `9222`)
+  - `REMOTE_CHROME_SECURE` — `true|false` (default `false`, set `true` for TLS tunnels)
+  - `REMOTE_CHROME_WS_ENDPOINT` — optional full WebSocket URL if you proxy Chrome
+  - `REMOTE_CHROME_CONNECT_TIMEOUT_MS` — timeout for connectivity checks (default `15000`)
+  - `WSL_HOST_IP` — optional helper env that overrides the default host value
 - Stealth / Human-like behavior
   - `STEALTH_ENABLED` — `true|false` (default `true`) — Master switch for all stealth features
   - `STEALTH_RANDOM_DELAYS` — `true|false` (default `true`)
@@ -59,18 +63,10 @@ For advanced users who want to set global defaults:
   - `TYPING_WPM_MIN` (default 160), `TYPING_WPM_MAX` (default 240)
 - Delays (human‑like)
   - `MIN_DELAY_MS` (default 100), `MAX_DELAY_MS` (default 400)
-- Browser
-  - `HEADLESS` (default `true`), `BROWSER_TIMEOUT` (ms, default `30000`)
+- Browser timing
+  - `BROWSER_TIMEOUT` (ms, default `30000`)
 - Sessions
   - `MAX_SESSIONS` (default 10), `SESSION_TIMEOUT` (s, default 900)
-- Multi‑instance profile strategy
-  - `NOTEBOOK_PROFILE_STRATEGY` — `auto|single|isolated` (default `auto`)
-  - `NOTEBOOK_CLONE_PROFILE` — clone base profile into isolated dir (default `false`)
-- Cleanup (to prevent disk bloat)
-  - `NOTEBOOK_CLEANUP_ON_STARTUP` (default `true`)
-  - `NOTEBOOK_CLEANUP_ON_SHUTDOWN` (default `true`)
-  - `NOTEBOOK_INSTANCE_TTL_HOURS` (default `72`)
-  - `NOTEBOOK_INSTANCE_MAX_COUNT` (default `20`)
 - Library metadata (optional hints)
   - `NOTEBOOK_DESCRIPTION`, `NOTEBOOK_TOPICS`, `NOTEBOOK_CONTENT_TYPES`, `NOTEBOOK_USE_CASES`
   - `NOTEBOOK_URL` — optional; leave empty and manage notebooks via the library
@@ -85,10 +81,10 @@ The server uses platform-specific paths via [env-paths](https://github.com/sindr
 - **Windows**: `%LOCALAPPDATA%\notebooklm-mcp\`
 
 **What's stored:**
-- `chrome_profile/` - Persistent Chrome browser profile with login session
-- `browser_state/` - Browser context state and cookies
 - `library.json` - Your notebook library with metadata
-- `chrome_profile_instances/` - Isolated Chrome profiles for concurrent sessions
+- Lightweight cache/log directories
+
+Chrome profiles remain on Windows; WSL no longer stores any browser data locally.
 
 **No config.json file** - Configuration is purely via environment variables or tool parameters!
 

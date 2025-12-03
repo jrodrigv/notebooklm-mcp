@@ -38,7 +38,6 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { AuthManager } from "./auth/auth-manager.js";
 import { SessionManager } from "./session/session-manager.js";
 import { NotebookLibrary } from "./library/notebook-library.js";
 import { ToolHandlers, buildToolDefinitions } from "./tools/index.js";
@@ -47,13 +46,16 @@ import { SettingsManager } from "./utils/settings-manager.js";
 import { CliHandler } from "./utils/cli-handler.js";
 import { CONFIG } from "./config.js";
 import { log } from "./utils/logger.js";
+import { SharedContextManager } from "./session/shared-context-manager.js";
+import { RemoteAuthCoordinator } from "./auth/remote-auth-coordinator.js";
 
 /**
  * Main MCP Server Class
  */
 class NotebookLMMCPServer {
   private server: Server;
-  private authManager: AuthManager;
+  private sharedContextManager: SharedContextManager;
+  private remoteAuth: RemoteAuthCoordinator;
   private sessionManager: SessionManager;
   private library: NotebookLibrary;
   private toolHandlers: ToolHandlers;
@@ -80,15 +82,16 @@ class NotebookLMMCPServer {
     );
 
     // Initialize managers
-    this.authManager = new AuthManager();
-    this.sessionManager = new SessionManager(this.authManager);
+    this.sharedContextManager = new SharedContextManager();
+    this.remoteAuth = new RemoteAuthCoordinator(this.sharedContextManager);
+    this.sessionManager = new SessionManager(this.sharedContextManager);
     this.library = new NotebookLibrary();
     this.settingsManager = new SettingsManager();
     
     // Initialize handlers
     this.toolHandlers = new ToolHandlers(
       this.sessionManager,
-      this.authManager,
+      this.remoteAuth,
       this.library
     );
     this.resourceHandlers = new ResourceHandlers(this.library);

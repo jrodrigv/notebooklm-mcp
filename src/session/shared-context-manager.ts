@@ -1,472 +1,202 @@
-/**
- * Shared Context Manager with Persistent Chrome Profile
- *
- * Manages ONE global persistent BrowserContext for ALL sessions.
- * This is critical for avoiding bot detection:
- *
- * - Google tracks browser fingerprints (Canvas, WebGL, Audio, Fonts, etc.)
- * - Multiple contexts = Multiple fingerprints = Suspicious!
- * - ONE persistent context = ONE consistent fingerprint = Normal user
- * - Persistent user_data_dir = SAME fingerprint across all app restarts!
- *
- * Based on the Python implementation from shared_context_manager.py
- */
-
-import type { BrowserContext } from "patchright";
+import type { Browser, BrowserContext } from "patchright";
 import { chromium } from "patchright";
 import { CONFIG } from "../config.js";
 import { log } from "../utils/logger.js";
-import { AuthManager } from "../auth/auth-manager.js";
-import fs from "fs";
-import path from "path";
+
+export interface RemoteDiagnostics {
+  connected: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  lastConnectedAt?: number | null;
+  lastError?: string | null;
+  wsEndpoint?: string | null;
+}
 
 /**
- * Shared Context Manager
- *
- * Benefits:
- * 1. ONE consistent browser fingerprint for all sessions
- * 2. Fingerprint persists across app restarts (user_data_dir)
- * 3. Mimics real user behavior (one browser, multiple tabs)
- * 4. Google sees: "Same browser since day 1"
+ * SharedContextManager now connects to a remote Chrome instance via CDP rather
+ * than spawning a local Chromium profile. This enables the MCP server to run
+ * inside WSL1 while driving the Chrome window that lives on the Windows host
+ * (or a Hyper-V VM).
  */
 export class SharedContextManager {
-  private authManager: AuthManager;
-  private globalContext: BrowserContext | null = null;
-  private contextCreatedAt: number | null = null;
-  private currentProfileDir: string | null = null;
-  private isIsolatedProfile: boolean = false;
-  private currentHeadlessMode: boolean | null = null;
+  private browser: Browser | null = null;
+  private context: BrowserContext | null = null;
+  private connecting: Promise<void> | null = null;
+  private lastError: string | null = null;
+  private lastConnectedAt: number | null = null;
+  private lastWsEndpoint: string | null = null;
 
-  constructor(authManager: AuthManager) {
-    this.authManager = authManager;
-
-    log.info("🌐 SharedContextManager initialized (PERSISTENT MODE)");
-    log.info(`  Chrome Profile: ${CONFIG.chromeProfileDir}`);
-    log.success("  Fingerprint: PERSISTENT across restarts! 🎯");
-
-    // Cleanup old isolated profiles at startup (best-effort)
-    if (CONFIG.cleanupInstancesOnStartup) {
-      void this.pruneIsolatedProfiles("startup");
-    }
-  }
-
-  /**
-   * Get the global shared persistent context, or create new if needed
-   *
-   * Context is recreated only when:
-   * - First time (no context exists in this app instance)
-   * - Context was closed/invalid
-   *
-   * Note: Auth expiry does NOT recreate context - we reuse the SAME
-   * fingerprint and just re-login!
-   *
-   * @param overrideHeadless Optional override for headless mode (true = show browser)
-   */
-  async getOrCreateContext(overrideHeadless?: boolean): Promise<BrowserContext> {
-    // Check if headless mode needs to be changed (e.g., show_browser=true)
-    // If yes, close the browser so it gets recreated with the new mode
-    if (this.needsHeadlessModeChange(overrideHeadless)) {
-      log.warning("🔄 Headless mode change detected - recreating browser context...");
-      await this.closeContext();
-    }
-
-    if (await this.needsRecreation()) {
-      log.warning("🔄 Creating/Loading persistent context...");
-      await this.recreateContext(overrideHeadless);
-    } else {
-      log.success("♻️  Reusing existing persistent context");
-    }
-
-    return this.globalContext!;
-  }
-
-  /**
-   * Check if global context needs to be recreated
-   */
-  private async needsRecreation(): Promise<boolean> {
-    // No context exists yet (first time or after manual close)
-    if (!this.globalContext) {
-      log.info("  ℹ️  No context exists yet");
-      return true;
-    }
-
-    // Async validity check (will throw if closed)
-    try {
-      await this.globalContext.cookies();
-      log.dim("  ✅ Context still valid (browser open)");
-      return false;
-    } catch (error) {
-      log.warning("  ⚠️  Context appears closed - will recreate");
-      this.globalContext = null;
-      this.contextCreatedAt = null;
-      this.currentHeadlessMode = null;
-      return true;
-    }
-  }
-
-  /**
-   * Create/Load the global PERSISTENT context with Chrome user_data_dir
-   *
-   * This is THE KEY to fingerprint persistence!
-   *
-   * First time:
-   * - Chrome creates new profile in user_data_dir
-   * - Generates fingerprint (Canvas, WebGL, Audio, etc.)
-   * - Saves everything to disk
-   *
-   * Subsequent starts:
-   * - Chrome loads profile from user_data_dir
-   * - SAME fingerprint as before! ✅
-   * - Google sees: "Same browser since day 1"
-   *
-   * @param overrideHeadless Optional override for headless mode (true = show browser)
-   */
-  private async recreateContext(overrideHeadless?: boolean): Promise<void> {
-    // Close old context if exists
-    if (this.globalContext) {
+  async getOrCreateContext(): Promise<BrowserContext> {
+    if (this.context) {
       try {
-        log.info("  🗑️  Closing old context...");
-        await this.globalContext.close();
-      } catch (error) {
-        log.warning(`  ⚠️  Error closing old context: ${error}`);
+        await this.context.pages();
+        return this.context;
+      } catch {
+        this.context = null;
+        this.browser = null;
       }
     }
 
-    // Check for saved auth
-    const statePath = await this.authManager.getValidStatePath();
-
-    if (statePath) {
-      log.success(`  📂 Found auth state: ${statePath}`);
-      log.info("  💡 Will load cookies into persistent profile");
-    } else {
-      log.warning("  🆕 No saved auth - fresh persistent profile");
-      log.info("  💡 First login will save auth to persistent profile");
+    if (!this.connecting) {
+      this.connecting = this.connect();
     }
 
-    // Determine headless mode: use override if provided, otherwise use CONFIG
-    const shouldBeHeadless = overrideHeadless !== undefined ? !overrideHeadless : CONFIG.headless;
+    await this.connecting;
+    this.connecting = null;
 
-    if (overrideHeadless !== undefined) {
-      log.info(`  Browser visibility override: ${overrideHeadless ? 'VISIBLE' : 'HEADLESS'}`);
+    if (!this.context) {
+      throw new Error("Failed to connect to remote Chrome instance");
     }
 
-    // Build launch options for persistent context
-    // NOTE: userDataDir is passed as first parameter, NOT in options!
-    const launchOptions = {
-      headless: shouldBeHeadless,
-      channel: "chrome" as const,
-      viewport: CONFIG.viewport,
-      locale: "en-US",
-      timezoneId: "Europe/Berlin",
-      // ✅ CRITICAL FIX: Pass storageState directly at launch!
-      // This is the PROPER way to handle session cookies (Playwright bug workaround)
-      // Benefits:
-      // - Session cookies persist correctly
-      // - No need for addCookies() workarounds
-      // - Chrome loads everything automatically
-      ...(statePath && { storageState: statePath }),
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--no-first-run",
-        "--no-default-browser-check",
-      ],
-    };
-
-    // 🔥 CRITICAL: launchPersistentContext creates/loads Chrome profile
-    // Strategy handling for concurrent instances
-    const baseProfile = CONFIG.chromeProfileDir;
-    const strategy = CONFIG.profileStrategy;
-    const tryLaunch = async (userDataDir: string) => {
-      log.info("  🚀 Launching persistent Chrome context...");
-      log.dim(`  📍 Profile location: ${userDataDir}`);
-      if (statePath) {
-        log.info(`  📄 Loading auth state: ${statePath}`);
-      }
-      return chromium.launchPersistentContext(userDataDir, launchOptions);
-    };
-
-    try {
-      if (strategy === "isolated") {
-        const isolatedDir = await this.prepareIsolatedProfileDir(baseProfile);
-        this.globalContext = await tryLaunch(isolatedDir);
-        this.currentProfileDir = isolatedDir;
-        this.isIsolatedProfile = true;
-      } else {
-        // single or auto → first try base
-        this.globalContext = await tryLaunch(baseProfile);
-        this.currentProfileDir = baseProfile;
-        this.isIsolatedProfile = false;
-      }
-    } catch (e: any) {
-      const msg = String(e?.message || e);
-      const isSingleton = /ProcessSingleton|SingletonLock|profile is already in use/i.test(msg);
-      if (strategy === "single" || !isSingleton) {
-        // hard fail
-        if (isSingleton && strategy === "single") {
-          log.error("❌ Chrome profile already in use and strategy=single. Close other instance or set NOTEBOOK_PROFILE_STRATEGY=auto/isolated.");
-        }
-        throw e;
-      }
-
-      // auto strategy with lock → fall back to isolated instance dir
-      log.warning("⚠️  Base Chrome profile in use by another process. Falling back to isolated per-instance profile...");
-      const isolatedDir = await this.prepareIsolatedProfileDir(baseProfile);
-      this.globalContext = await tryLaunch(isolatedDir);
-      this.currentProfileDir = isolatedDir;
-      this.isIsolatedProfile = true;
-    }
-    this.contextCreatedAt = Date.now();
-    this.currentHeadlessMode = shouldBeHeadless;
-    // Track close event to force recreation next time
-    try {
-      this.globalContext.on("close", () => {
-        log.warning("  🛑 Persistent context was closed externally");
-        this.globalContext = null;
-        this.contextCreatedAt = null;
-        this.currentHeadlessMode = null;
-      });
-    } catch {}
-
-    // Validate cookies if we loaded state
-    if (statePath) {
-      try {
-        if (await this.authManager.validateCookiesExpiry(this.globalContext)) {
-          log.success("  ✅ Authentication state loaded successfully");
-          log.success("  🎯 Session cookies persisted correctly!");
-        } else {
-          log.warning("  ⚠️  Cookies expired - will need re-login");
-        }
-      } catch (error) {
-        log.warning(`  ⚠️  Could not validate auth state: ${error}`);
-      }
-    }
-
-    log.success("✅ Persistent context ready!");
-    log.dim(`  Context ID: ${this.getContextId()}`);
-    log.dim(`  Chrome Profile: ${CONFIG.chromeProfileDir}`);
-    log.success("  🎯 Fingerprint: PERSISTENT (same across restarts!)");
+    return this.context;
   }
 
   /**
-   * Manually close the global context (e.g., on shutdown)
-   *
-   * Note: This closes the context for ALL sessions!
-   * Chrome will save everything to user_data_dir automatically.
+   * Close our CDP connection without shutting down the host Chrome instance.
    */
   async closeContext(): Promise<void> {
-    if (this.globalContext) {
-      log.warning("🛑 Closing persistent context...");
-      log.info("  💾 Chrome is saving profile to disk...");
-      try {
-        await this.globalContext.close();
-        this.globalContext = null;
-        this.contextCreatedAt = null;
-        this.currentHeadlessMode = null;
-        log.success("✅ Persistent context closed");
-        log.success(`  💾 Profile saved: ${this.currentProfileDir || CONFIG.chromeProfileDir}`);
-      } catch (error) {
-        log.error(`❌ Error closing context: ${error}`);
-      }
-    }
+    this.context = null;
 
-    // Best-effort cleanup on shutdown
-    if (CONFIG.cleanupInstancesOnShutdown) {
+    if (this.browser) {
       try {
-        // If this process used an isolated profile, remove it now
-        if (this.isIsolatedProfile && this.currentProfileDir) {
-          await this.safeRemoveIsolatedProfile(this.currentProfileDir);
+        // Disconnect without closing the actual Chrome instance.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const anyBrowser = this.browser as any;
+        if (typeof anyBrowser._connection?.close === "function") {
+          await anyBrowser._connection.close();
         }
-      } catch (err) {
-        log.warning(`  ⚠️  Cleanup (self) failed: ${err}`);
+      } catch {
+        // ignore disconnect errors
+      } finally {
+        this.browser = null;
       }
-      try {
-        await this.pruneIsolatedProfiles("shutdown");
-      } catch (err) {
-        log.warning(`  ⚠️  Cleanup (prune) failed: ${err}`);
-      }
-    }
-  }
-
-  private async prepareIsolatedProfileDir(baseProfile: string): Promise<string> {
-    const stamp = `${process.pid}-${Date.now()}`;
-    const dir = path.join(CONFIG.chromeInstancesDir, `instance-${stamp}`);
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      if (CONFIG.cloneProfileOnIsolated && fs.existsSync(baseProfile)) {
-        log.info("  🧬 Cloning base Chrome profile into isolated instance (may take time)...");
-        // Best-effort clone without locks
-        await (fs.promises as any).cp(baseProfile, dir, {
-          recursive: true,
-          errorOnExist: false,
-          force: true,
-          filter: (src: string) => {
-            const bn = path.basename(src);
-            return !/^Singleton/i.test(bn) && !bn.endsWith(".lock") && !bn.endsWith(".tmp");
-          },
-        } as any);
-        log.success("  ✅ Clone complete");
-      } else {
-        log.info("  🧪 Using fresh isolated Chrome profile (no clone)");
-      }
-    } catch (err) {
-      log.warning(`  ⚠️  Could not prepare isolated profile: ${err}`);
-    }
-    return dir;
-  }
-
-  private async pruneIsolatedProfiles(phase: "startup" | "shutdown"): Promise<void> {
-    const root = CONFIG.chromeInstancesDir;
-    let entries: Array<{ path: string; mtimeMs: number }>; 
-    try {
-      const names = await fs.promises.readdir(root, { withFileTypes: true });
-      entries = [];
-      for (const d of names) {
-        if (!d.isDirectory()) continue;
-        const p = path.join(root, d.name);
-        try {
-          const st = await fs.promises.stat(p);
-          entries.push({ path: p, mtimeMs: st.mtimeMs });
-        } catch {}
-      }
-    } catch {
-      return; // directory absent is fine
-    }
-
-    if (entries.length === 0) return;
-
-    const now = Date.now();
-    const ttlMs = CONFIG.instanceProfileTtlHours * 3600 * 1000;
-    const maxCount = Math.max(0, CONFIG.instanceProfileMaxCount);
-
-    // Sort newest first
-    entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    const keep: Set<string> = new Set();
-    const toDelete: Set<string> = new Set();
-
-    // Keep newest up to maxCount
-    for (let i = 0; i < entries.length; i++) {
-      const e = entries[i];
-      const ageMs = now - e.mtimeMs;
-      const overTtl = ttlMs > 0 && ageMs > ttlMs;
-      const overCount = i >= maxCount;
-      const isCurrent = this.currentProfileDir && path.resolve(e.path) === path.resolve(this.currentProfileDir);
-      if (!isCurrent && (overTtl || overCount)) {
-        toDelete.add(e.path);
-      } else {
-        keep.add(e.path);
-      }
-    }
-
-    if (toDelete.size === 0) return;
-    log.info(`🧹 Pruning isolated profiles (${phase})...`);
-    for (const p of toDelete) {
-      try {
-        await this.safeRemoveIsolatedProfile(p);
-        log.dim(`  🗑️  removed ${p}`);
-      } catch (err) {
-        log.warning(`  ⚠️  Failed to remove ${p}: ${err}`);
-      }
-    }
-  }
-
-  private async safeRemoveIsolatedProfile(dir: string): Promise<void> {
-    // Never remove the base profile
-    if (path.resolve(dir) === path.resolve(CONFIG.chromeProfileDir)) return;
-    // Only remove within instances root
-    if (!path.resolve(dir).startsWith(path.resolve(CONFIG.chromeInstancesDir))) return;
-    // Best-effort: try removing typical lock files first, then the directory
-    try {
-      await fs.promises.rm(dir, { recursive: true, force: true } as any);
-    } catch (err) {
-      // If rm is not available in older node, fallback to rmdir
-      try {
-        await (fs.promises as any).rmdir(dir, { recursive: true });
-      } catch {}
     }
   }
 
   /**
-   * Get information about the global persistent context
+   * Returns cached diagnostics about the remote connection.
    */
-  getContextInfo(): {
-    exists: boolean;
-    age_seconds?: number;
-    age_hours?: number;
-    fingerprint_id?: string;
-    user_data_dir: string;
-    persistent: boolean;
-  } {
-    if (!this.globalContext) {
-      return {
-        exists: false,
-        user_data_dir: CONFIG.chromeProfileDir,
-        persistent: true,
-      };
-    }
-
-    const ageSeconds = this.contextCreatedAt
-      ? (Date.now() - this.contextCreatedAt) / 1000
-      : undefined;
-    const ageHours = ageSeconds ? ageSeconds / 3600 : undefined;
-
+  getDiagnostics(): RemoteDiagnostics {
     return {
-      exists: true,
-      age_seconds: ageSeconds,
-      age_hours: ageHours,
-      fingerprint_id: this.getContextId(),
-      user_data_dir: CONFIG.chromeProfileDir,
-      persistent: true,
+      connected: !!this.browser && !!this.context,
+      host: CONFIG.remoteChromeHost,
+      port: CONFIG.remoteChromePort,
+      secure: CONFIG.remoteChromeSecure,
+      lastConnectedAt: this.lastConnectedAt,
+      lastError: this.lastError,
+      wsEndpoint: this.lastWsEndpoint,
     };
   }
 
   /**
-   * Get the current headless mode of the browser context
-   *
-   * @returns boolean | null - true if headless, false if visible, null if no context exists
+   * Performs a lightweight HTTP request against the remote debugging endpoint
+   * to determine whether Chrome is reachable.
    */
-  getCurrentHeadlessMode(): boolean | null {
-    return this.currentHeadlessMode;
+  async checkRemoteAvailability(): Promise<{ reachable: boolean; detail?: string }> {
+    const url = this.buildVersionUrl();
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), CONFIG.remoteChromeConnectTimeoutMs);
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        return { reachable: false, detail: `HTTP ${response.status}` };
+      }
+
+      await response.json();
+      return { reachable: true };
+    } catch (error) {
+      return { reachable: false, detail: String(error) };
+    }
   }
 
-  /**
-   * Check if the browser context needs to be recreated due to headless mode change
-   *
-   * @param overrideHeadless - Optional override for headless mode (true = show browser)
-   * @returns boolean - true if context needs to be recreated with new mode
-   */
-  needsHeadlessModeChange(overrideHeadless?: boolean): boolean {
-    // No context exists yet = will be created with correct mode anyway
-    if (this.currentHeadlessMode === null) {
-      return false;
+  private async connect(): Promise<void> {
+    try {
+      const wsEndpoint = await this.resolveWsEndpoint();
+      this.lastWsEndpoint = wsEndpoint;
+
+      log.info(`🌐 Connecting to remote Chrome: ${wsEndpoint}`);
+      this.browser = await chromium.connectOverCDP(wsEndpoint);
+
+      const contexts = this.browser.contexts();
+      if (contexts.length === 0) {
+        throw new Error(
+          "Remote Chrome did not expose a default context. Start Chrome with --remote-debugging-port."
+        );
+      }
+
+      this.context = contexts[0];
+      this.context.on("close", () => {
+        this.context = null;
+      });
+      this.browser.on("disconnected", () => {
+        this.browser = null;
+        this.context = null;
+      });
+
+      this.lastConnectedAt = Date.now();
+      this.lastError = null;
+      log.success("✅ Connected to remote Chrome via CDP");
+    } catch (error) {
+      this.browser = null;
+      this.context = null;
+      this.lastError = String(error);
+      log.error(`❌ Failed to connect to remote Chrome: ${error}`);
+      throw error;
     }
-
-    // Calculate target headless mode
-    // If override is specified, use it (!overrideHeadless because true = show browser = headless false)
-    // Otherwise, use CONFIG.headless (which may have been temporarily modified by browser_options)
-    const targetHeadless = overrideHeadless !== undefined
-      ? !overrideHeadless
-      : CONFIG.headless;
-
-    // Compare with current mode
-    const needsChange = this.currentHeadlessMode !== targetHeadless;
-
-    if (needsChange) {
-      log.info(`  Browser mode change detected: ${this.currentHeadlessMode ? 'HEADLESS' : 'VISIBLE'} → ${targetHeadless ? 'HEADLESS' : 'VISIBLE'}`);
-    }
-
-    return needsChange;
   }
 
-  /**
-   * Get context ID for logging
-   */
-  private getContextId(): string {
-    if (!this.globalContext) {
-      return "none";
+  private async resolveWsEndpoint(): Promise<string> {
+    if (CONFIG.remoteChromeWsEndpoint) {
+      return this.normalizeWsEndpoint(CONFIG.remoteChromeWsEndpoint);
     }
-    // Use object hash as ID
-    return `ctx-${(this.globalContext as any)._guid || "unknown"}`;
+
+    const url = this.buildVersionUrl();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONFIG.remoteChromeConnectTimeoutMs);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to reach remote Chrome at ${url} (HTTP ${response.status}). ` +
+        "Ensure Chrome was launched with --remote-debugging-port."
+      );
+    }
+
+    const data = (await response.json()) as {
+      webSocketDebuggerUrl?: string;
+      websocketDebuggerUrl?: string;
+    };
+    const wsUrl = data.webSocketDebuggerUrl || data.websocketDebuggerUrl;
+    if (!wsUrl) {
+      throw new Error(
+        `Remote Chrome at ${url} did not report a webSocketDebuggerUrl field.`
+      );
+    }
+
+    return this.normalizeWsEndpoint(wsUrl);
+  }
+
+  private buildVersionUrl(): string {
+    const protocol = CONFIG.remoteChromeSecure ? "https" : "http";
+    return `${protocol}://${CONFIG.remoteChromeHost}:${CONFIG.remoteChromePort}/json/version`;
+  }
+
+  private normalizeWsEndpoint(raw: string): string {
+    try {
+      const url = new URL(raw);
+      url.protocol = CONFIG.remoteChromeSecure ? "wss:" : "ws:";
+      url.hostname = CONFIG.remoteChromeHost;
+      url.port = String(CONFIG.remoteChromePort);
+      return url.toString();
+    } catch {
+      // raw might be a bare host:port - rebuild from scratch
+      const protocol = CONFIG.remoteChromeSecure ? "wss" : "ws";
+      return `${protocol}://${CONFIG.remoteChromeHost}:${CONFIG.remoteChromePort}${raw}`;
+    }
   }
 }

@@ -3,6 +3,8 @@
 This guide covers advanced usage patterns, best practices, and detailed examples for the NotebookLM MCP server.
 
 > 📘 For installation and quick start, see the main [README](../README.md).
+>
+> ⚠️ This WSL1-specific branch drives a Chrome window on the Windows host via remote debugging (`--remote-debugging-port=9222`). Always keep that Chrome instance running while the MCP server operates inside WSL/Codex.
 
 ## Research Patterns
 

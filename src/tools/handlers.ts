@@ -5,7 +5,7 @@
  */
 
 import { SessionManager } from "../session/session-manager.js";
-import { AuthManager } from "../auth/auth-manager.js";
+import { RemoteAuthCoordinator } from "../auth/remote-auth-coordinator.js";
 import { NotebookLibrary } from "../library/notebook-library.js";
 import type { AddNotebookInput, UpdateNotebookInput } from "../library/types.js";
 import { CONFIG, applyBrowserOptions, type BrowserOptions } from "../config.js";
@@ -26,12 +26,12 @@ const FOLLOW_UP_REMINDER =
  */
 export class ToolHandlers {
   private sessionManager: SessionManager;
-  private authManager: AuthManager;
+  private remoteAuth: RemoteAuthCoordinator;
   private library: NotebookLibrary;
 
-  constructor(sessionManager: SessionManager, authManager: AuthManager, library: NotebookLibrary) {
+  constructor(sessionManager: SessionManager, remoteAuth: RemoteAuthCoordinator, library: NotebookLibrary) {
     this.sessionManager = sessionManager;
-    this.authManager = authManager;
+    this.remoteAuth = remoteAuth;
     this.library = library;
   }
 
@@ -60,7 +60,11 @@ export class ToolHandlers {
       log.info(`  Notebook ID: ${notebook_id}`);
     }
     if (notebook_url) {
-      log.info(`  Notebook URL: ${notebook_url}`);
+    log.info(`  Notebook URL: ${notebook_url}`);
+    }
+
+    if (show_browser !== undefined) {
+      log.info("  ℹ️  show_browser is ignored in remote mode (Chrome runs on Windows).");
     }
 
     try {
@@ -95,23 +99,11 @@ export class ToolHandlers {
       const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
       Object.assign(CONFIG, effectiveConfig);
 
-      // Calculate overrideHeadless parameter for session manager
-      // show_browser takes precedence over browser_options.headless
-      let overrideHeadless: boolean | undefined = undefined;
-      if (show_browser !== undefined) {
-        overrideHeadless = show_browser;
-      } else if (browser_options?.show !== undefined) {
-        overrideHeadless = browser_options.show;
-      } else if (browser_options?.headless !== undefined) {
-        overrideHeadless = !browser_options.headless;
-      }
-
       try {
         // Get or create session (with headless override to handle mode changes)
         const session = await this.sessionManager.getOrCreateSession(
           session_id,
-          resolvedNotebookUrl,
-          overrideHeadless
+          resolvedNotebookUrl
         );
 
       // Progress: Asking question
@@ -336,8 +328,14 @@ export class ToolHandlers {
       max_sessions: number;
       session_timeout: number;
       total_messages: number;
-      headless: boolean;
-      auto_login_enabled: boolean;
+      remote_chrome: {
+        host: string;
+        port: number;
+        secure: boolean;
+        reachable: boolean;
+        detail?: string;
+        last_connected_at?: number;
+      };
       stealth_enabled: boolean;
       troubleshooting_tip?: string;
     }> 
@@ -345,29 +343,34 @@ export class ToolHandlers {
     log.info(`🔧 [TOOL] get_health called`);
 
     try {
-      // Check authentication status
-      const statePath = await this.authManager.getValidStatePath();
-      const authenticated = statePath !== null;
+      const availability = await this.sessionManager.checkRemoteAvailability();
+      const diagnostics = this.sessionManager.getConnectionDiagnostics();
+      const authenticated = this.sessionManager.hasConfirmedAuthentication();
 
       // Get session stats
       const stats = this.sessionManager.getStats();
 
       const result = {
-        status: "ok",
+        status: availability.reachable ? "ok" : "remote_unreachable",
         authenticated,
         notebook_url: CONFIG.notebookUrl || "not configured",
         active_sessions: stats.active_sessions,
         max_sessions: stats.max_sessions,
         session_timeout: stats.session_timeout,
         total_messages: stats.total_messages,
-        headless: CONFIG.headless,
-        auto_login_enabled: CONFIG.autoLoginEnabled,
+        remote_chrome: {
+          host: CONFIG.remoteChromeHost,
+          port: CONFIG.remoteChromePort,
+          secure: CONFIG.remoteChromeSecure,
+          reachable: availability.reachable,
+          detail: availability.detail || diagnostics.lastError || undefined,
+          last_connected_at: diagnostics.lastConnectedAt || undefined,
+        },
         stealth_enabled: CONFIG.stealthEnabled,
         // Add troubleshooting tip if not authenticated
         ...((!authenticated) && {
           troubleshooting_tip:
-            "For fresh start with clean browser session: Close all Chrome instances → " +
-            "cleanup_data(confirm=true, preserve_library=true) → setup_auth"
+            "Ensure Chrome is running on Windows with --remote-debugging-port=9222, then run setup_auth to log in via the host browser."
         }),
       };
 
@@ -419,46 +422,43 @@ export class ToolHandlers {
 
     const startTime = Date.now();
 
-    // Apply browser options temporarily
+    // Apply browser options temporarily (kept for backwards compatibility even though visibility flags are ignored)
     const originalConfig = { ...CONFIG };
     const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
     Object.assign(CONFIG, effectiveConfig);
 
     try {
-      // Progress: Starting
-      await sendProgress?.("Preparing authentication browser...", 1, 10);
+      if (show_browser !== undefined) {
+        log.info("  ℹ️  show_browser is ignored in remote mode (Chrome runs on Windows).");
+      }
 
-      log.info(`  🌐 Opening browser for interactive login...`);
-
-      // Progress: Opening browser
-      await sendProgress?.("Opening browser window...", 2, 10);
-
-      // Perform setup with progress updates (uses CONFIG internally)
-      const success = await this.authManager.performSetup(sendProgress);
-
-      const durationSeconds = (Date.now() - startTime) / 1000;
-
-      if (success) {
-        // Progress: Complete
-        await sendProgress?.("Authentication saved successfully!", 10, 10);
-
-        log.success(`✅ [TOOL] setup_auth completed (${durationSeconds.toFixed(1)}s)`);
-        return {
-          success: true,
-          data: {
-            status: "authenticated",
-            message: "Successfully authenticated and saved browser state",
-            authenticated: true,
-            duration_seconds: durationSeconds,
-          },
-        };
-      } else {
-        log.error(`❌ [TOOL] setup_auth failed (${durationSeconds.toFixed(1)}s)`);
+      const availability = await this.sessionManager.checkRemoteAvailability();
+      if (!availability.reachable) {
+        const detail = availability.detail ? ` (${availability.detail})` : "";
         return {
           success: false,
-          error: "Authentication failed or was cancelled",
+          error:
+            `Remote Chrome at ${CONFIG.remoteChromeHost}:${CONFIG.remoteChromePort} is not reachable${detail}. ` +
+            "Ensure Chrome was started on Windows with --remote-debugging-port=9222 and retry.",
         };
       }
+
+      await sendProgress?.("Launching auth tab in remote Chrome...", 2, 10);
+      await this.remoteAuth.runSetup(sendProgress);
+      this.sessionManager.markAuthenticated();
+
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      await sendProgress?.("Authentication complete!", 10, 10);
+      log.success(`✅ [TOOL] setup_auth completed (${durationSeconds.toFixed(1)}s)`);
+      return {
+        success: true,
+        data: {
+          status: "authenticated",
+          message: "Authenticated via remote Chrome window. The Windows browser stays logged in.",
+          authenticated: true,
+          duration_seconds: durationSeconds,
+        },
+      };
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -469,7 +469,6 @@ export class ToolHandlers {
         error: errorMessage,
       };
     } finally {
-      // Restore original CONFIG
       Object.assign(CONFIG, originalConfig);
     }
   }
@@ -508,51 +507,54 @@ export class ToolHandlers {
 
     const startTime = Date.now();
 
-    // Apply browser options temporarily
     const originalConfig = { ...CONFIG };
     const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
     Object.assign(CONFIG, effectiveConfig);
 
     try {
+      if (show_browser !== undefined) {
+        log.info("  ℹ️  show_browser is ignored in remote mode (Chrome runs on Windows).");
+      }
+
       // 1. Close all active sessions
       await sendProgress?.("Closing all active sessions...", 1, 12);
       log.info("  🛑 Closing all sessions...");
       await this.sessionManager.closeAllSessions();
+      this.sessionManager.resetAuthConfirmation();
       log.success("  ✅ All sessions closed");
 
-      // 2. Clear all auth data
-      await sendProgress?.("Clearing authentication data...", 2, 12);
-      log.info("  🗑️  Clearing all auth data...");
-      await this.authManager.clearAllAuthData();
-      log.success("  ✅ Auth data cleared");
-
-      // 3. Perform fresh setup
-      await sendProgress?.("Starting fresh authentication...", 3, 12);
-      log.info("  🌐 Starting fresh authentication setup...");
-      const success = await this.authManager.performSetup(sendProgress);
-
-      const durationSeconds = (Date.now() - startTime) / 1000;
-
-      if (success) {
-        await sendProgress?.("Re-authentication complete!", 12, 12);
-        log.success(`✅ [TOOL] re_auth completed (${durationSeconds.toFixed(1)}s)`);
-        return {
-          success: true,
-          data: {
-            status: "authenticated",
-            message:
-              "Successfully re-authenticated with new account. All previous sessions have been closed.",
-            authenticated: true,
-            duration_seconds: durationSeconds,
-          },
-        };
-      } else {
-        log.error(`❌ [TOOL] re_auth failed (${durationSeconds.toFixed(1)}s)`);
+      // 2. Ensure remote Chrome is available
+      await sendProgress?.("Checking remote Chrome availability...", 2, 12);
+      const availability = await this.sessionManager.checkRemoteAvailability();
+      if (!availability.reachable) {
+        const detail = availability.detail ? ` (${availability.detail})` : "";
         return {
           success: false,
-          error: "Re-authentication failed or was cancelled",
+          error:
+            `Remote Chrome at ${CONFIG.remoteChromeHost}:${CONFIG.remoteChromePort} is not reachable${detail}. ` +
+            "Start Chrome on the Windows side with --remote-debugging-port=9222 and retry.",
         };
       }
+
+      // 3. Run logout + login flow
+      await sendProgress?.("Logging out and reopening NotebookLM...", 3, 12);
+      log.info("  🌐 Starting remote re-authentication flow...");
+      await this.remoteAuth.runReAuth(sendProgress);
+      this.sessionManager.markAuthenticated();
+
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      await sendProgress?.("Re-authentication complete!", 12, 12);
+      log.success(`✅ [TOOL] re_auth completed (${durationSeconds.toFixed(1)}s)`);
+      return {
+        success: true,
+        data: {
+          status: "authenticated",
+          message:
+            "Remote Chrome logged in with the new Google account. Sessions will reuse this Windows browser.",
+          authenticated: true,
+          duration_seconds: durationSeconds,
+        },
+      };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const durationSeconds = (Date.now() - startTime) / 1000;
@@ -564,7 +566,6 @@ export class ToolHandlers {
         error: errorMessage,
       };
     } finally {
-      // Restore original CONFIG
       Object.assign(CONFIG, originalConfig);
     }
   }

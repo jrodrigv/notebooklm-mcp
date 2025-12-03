@@ -9,11 +9,11 @@
 - `get_health`
   - Summaries auth status, active sessions, and configuration.
 - `setup_auth`
-  - Opens the persistent Chrome profile so you can log in manually.
+  - Opens a new tab inside the Windows Chrome instance (connected via CDP) so you can log in manually.
 - `re_auth`
   - Switch to a different Google account or re-authenticate.
   - Use when NotebookLM rate limit is reached (50 queries/day for free accounts).
-  - Closes all sessions, clears auth data, and opens browser for fresh login.
+  - Closes all sessions, reloads the Windows Chrome tab at `accounts.google.com/Logout`, and waits for a fresh login.
 
 ### Notebook library
 - `add_notebook` – Safe conversational add; expects confirmation before writing.

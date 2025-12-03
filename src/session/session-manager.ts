@@ -7,30 +7,24 @@
  * - Session lifecycle management
  * - Auto-cleanup of inactive sessions
  * - Resource limits (max concurrent sessions)
- * - Shared PERSISTENT browser fingerprint (ONE context for all sessions)
- *
- * Based on the Python implementation from session_manager.py
+ * - Shared remote Chrome connection via CDP
  */
 
-import { AuthManager } from "../auth/auth-manager.js";
 import { BrowserSession } from "./browser-session.js";
-import { SharedContextManager } from "./shared-context-manager.js";
+import { SharedContextManager, type RemoteDiagnostics } from "./shared-context-manager.js";
 import { CONFIG } from "../config.js";
 import { log } from "../utils/logger.js";
 import type { SessionInfo } from "../types.js";
 import { randomBytes } from "crypto";
 
 export class SessionManager {
-  private authManager: AuthManager;
-  private sharedContextManager: SharedContextManager;
   private sessions: Map<string, BrowserSession> = new Map();
   private maxSessions: number;
   private sessionTimeout: number;
   private cleanupInterval?: NodeJS.Timeout;
+  private authConfirmed: boolean = false;
 
-  constructor(authManager: AuthManager) {
-    this.authManager = authManager;
-    this.sharedContextManager = new SharedContextManager(authManager);
+  constructor(private readonly sharedContextManager: SharedContextManager) {
     this.maxSessions = CONFIG.maxSessions;
     this.sessionTimeout = CONFIG.sessionTimeout;
 
@@ -52,26 +46,14 @@ export class SessionManager {
     this.cleanupInterval.unref();
   }
 
-  /**
-   * Generate a unique session ID
-   */
   private generateSessionId(): string {
     return randomBytes(4).toString("hex");
   }
 
-  /**
-   * Get existing session or create a new one
-   *
-   * @param sessionId Optional session ID to reuse existing session
-   * @param notebookUrl Notebook URL for the session
-   * @param overrideHeadless Optional override for headless mode (true = show browser)
-   */
   async getOrCreateSession(
     sessionId?: string,
-    notebookUrl?: string,
-    overrideHeadless?: boolean
+    notebookUrl?: string
   ): Promise<BrowserSession> {
-    // Determine target notebook URL
     const targetUrl = (notebookUrl || CONFIG.notebookUrl || "").trim();
     if (!targetUrl) {
       throw new Error("Notebook URL is required to create a session");
@@ -80,26 +62,11 @@ export class SessionManager {
       throw new Error("Notebook URL must be an absolute URL");
     }
 
-    // Generate ID if not provided
     if (!sessionId) {
       sessionId = this.generateSessionId();
       log.info(`🆕 Auto-generated session ID: ${sessionId}`);
     }
 
-    // Check if browser visibility mode needs to change
-    if (overrideHeadless !== undefined) {
-      if (this.sharedContextManager.needsHeadlessModeChange(overrideHeadless)) {
-        log.warning(`🔄 Browser visibility changed - closing all sessions to recreate browser context...`);
-        const currentMode = this.sharedContextManager.getCurrentHeadlessMode();
-        log.info(`  Switching from ${currentMode ? 'HEADLESS' : 'VISIBLE'} to ${overrideHeadless ? 'VISIBLE' : 'HEADLESS'}`);
-
-        // Close all sessions (they all use the same context)
-        await this.closeAllSessions();
-        log.success(`  ✅ All sessions closed, browser context will be recreated with new mode`);
-      }
-    }
-
-    // Return existing session if found
     if (this.sessions.has(sessionId)) {
       const session = this.sessions.get(sessionId)!;
       if (session.notebookUrl !== targetUrl) {
@@ -113,7 +80,6 @@ export class SessionManager {
       }
     }
 
-    // Check if we need to free up space
     if (this.sessions.size >= this.maxSessions) {
       log.warning(`⚠️  Max sessions (${this.maxSessions}) reached, cleaning up...`);
       const freed = await this.cleanupOldestSession();
@@ -124,20 +90,14 @@ export class SessionManager {
       }
     }
 
-    // Create new session
     log.info(`🆕 Creating new session ${sessionId}...`);
-    if (overrideHeadless !== undefined) {
-      log.info(`  Show browser: ${overrideHeadless}`);
-    }
     try {
-      // Ensure the shared context exists (ONE fingerprint for all sessions!)
-      await this.sharedContextManager.getOrCreateContext(overrideHeadless);
+      await this.sharedContextManager.getOrCreateContext();
 
-      // Create and initialize session
       const session = new BrowserSession(
         sessionId,
         this.sharedContextManager,
-        this.authManager,
+        () => this.markAuthenticated(),
         targetUrl
       );
       await session.init();
@@ -153,16 +113,10 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Get an existing session by ID
-   */
   getSession(sessionId: string): BrowserSession | null {
     return this.sessions.get(sessionId) || null;
   }
 
-  /**
-   * Close and remove a specific session
-   */
   async closeSession(sessionId: string): Promise<boolean> {
     if (!this.sessions.has(sessionId)) {
       log.warning(`⚠️  Session ${sessionId} not found`);
@@ -179,9 +133,6 @@ export class SessionManager {
     return true;
   }
 
-  /**
-   * Close all sessions that are using the provided notebook URL
-   */
   async closeSessionsForNotebook(url: string): Promise<number> {
     let closed = 0;
 
@@ -207,9 +158,6 @@ export class SessionManager {
     return closed;
   }
 
-  /**
-   * Clean up all inactive sessions
-   */
   async cleanupInactiveSessions(): Promise<number> {
     const inactiveSessions: string[] = [];
 
@@ -248,15 +196,11 @@ export class SessionManager {
     return inactiveSessions.length;
   }
 
-  /**
-   * Clean up the oldest session to make space
-   */
   private async cleanupOldestSession(): Promise<boolean> {
     if (this.sessions.size === 0) {
       return false;
     }
 
-    // Find oldest session
     let oldestId: string | null = null;
     let oldestTime = Infinity;
 
@@ -273,7 +217,6 @@ export class SessionManager {
 
     const oldestSession = this.sessions.get(oldestId)!;
     const age = (Date.now() - oldestSession.createdAt) / 1000;
-
     log.warning(`🗑️  Removing oldest session ${oldestId} (age: ${age.toFixed(0)}s)`);
 
     await oldestSession.close();
@@ -282,9 +225,6 @@ export class SessionManager {
     return true;
   }
 
-  /**
-   * Close all sessions (used during shutdown)
-   */
   async closeAllSessions(): Promise<void> {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
@@ -310,22 +250,14 @@ export class SessionManager {
       }
     }
 
-    // Close the shared context
     await this.sharedContextManager.closeContext();
-
     log.success("✅ All sessions closed");
   }
 
-  /**
-   * Get all sessions info
-   */
   getAllSessionsInfo(): SessionInfo[] {
     return Array.from(this.sessions.values()).map((session) => session.getInfo());
   }
 
-  /**
-   * Get aggregate stats
-   */
   getStats(): {
     active_sessions: number;
     max_sessions: number;
@@ -351,5 +283,25 @@ export class SessionManager {
       oldest_session_seconds: oldestSessionSeconds,
       total_messages: totalMessages,
     };
+  }
+
+  markAuthenticated(): void {
+    this.authConfirmed = true;
+  }
+
+  resetAuthConfirmation(): void {
+    this.authConfirmed = false;
+  }
+
+  hasConfirmedAuthentication(): boolean {
+    return this.authConfirmed;
+  }
+
+  getConnectionDiagnostics(): RemoteDiagnostics {
+    return this.sharedContextManager.getDiagnostics();
+  }
+
+  async checkRemoteAvailability(): Promise<{ reachable: boolean; detail?: string }> {
+    return this.sharedContextManager.checkRemoteAvailability();
   }
 }

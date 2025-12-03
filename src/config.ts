@@ -11,7 +11,6 @@
 
 import envPaths from "env-paths";
 import fs from "fs";
-import path from "path";
 
 // Cross-platform data paths (unified without -nodejs suffix)
 // Linux: ~/.local/share/notebooklm-mcp/
@@ -31,7 +30,14 @@ export interface Config {
   // NotebookLM - optional, used for legacy default notebook
   notebookUrl: string;
 
-  // Browser Settings
+  // Remote Chrome connection (Windows host / Hyper-V VM)
+  remoteChromeHost: string;
+  remoteChromePort: number;
+  remoteChromeSecure: boolean;
+  remoteChromeWsEndpoint?: string;
+  remoteChromeConnectTimeoutMs: number;
+
+  // Browser Settings (apply to automation behavior inside remote Chrome)
   headless: boolean;
   browserTimeout: number;
   viewport: { width: number; height: number };
@@ -41,11 +47,6 @@ export interface Config {
   sessionTimeout: number; // in seconds
 
   // Authentication
-  autoLoginEnabled: boolean;
-  loginEmail: string;
-  loginPassword: string;
-  autoLoginTimeoutMs: number;
-
   // Stealth Settings
   stealthEnabled: boolean;
   stealthRandomDelays: boolean;
@@ -59,9 +60,6 @@ export interface Config {
   // Paths
   configDir: string;
   dataDir: string;
-  browserStateDir: string;
-  chromeProfileDir: string;
-  chromeInstancesDir: string;
 
   // Library Configuration (optional, for default notebook metadata)
   notebookDescription: string;
@@ -69,13 +67,6 @@ export interface Config {
   notebookContentTypes: string[];
   notebookUseCases: string[];
 
-  // Multi-instance profile strategy
-  profileStrategy: "auto" | "single" | "isolated";
-  cloneProfileOnIsolated: boolean;
-  cleanupInstancesOnStartup: boolean;
-  cleanupInstancesOnShutdown: boolean;
-  instanceProfileTtlHours: number;
-  instanceProfileMaxCount: number;
 }
 
 /**
@@ -85,6 +76,13 @@ const DEFAULTS: Config = {
   // NotebookLM
   notebookUrl: "",
 
+  // Remote Chrome connection
+  remoteChromeHost: process.env.WSL_HOST_IP || "127.0.0.1",
+  remoteChromePort: 9222,
+  remoteChromeSecure: false,
+  remoteChromeWsEndpoint: process.env.REMOTE_CHROME_WS_ENDPOINT,
+  remoteChromeConnectTimeoutMs: 15000,
+
   // Browser Settings
   headless: true,
   browserTimeout: 30000,
@@ -93,12 +91,6 @@ const DEFAULTS: Config = {
   // Session Management
   maxSessions: 10,
   sessionTimeout: 900, // 15 minutes
-
-  // Authentication
-  autoLoginEnabled: false,
-  loginEmail: "",
-  loginPassword: "",
-  autoLoginTimeoutMs: 120000, // 2 minutes
 
   // Stealth Settings
   stealthEnabled: true,
@@ -113,23 +105,12 @@ const DEFAULTS: Config = {
   // Paths (cross-platform via env-paths)
   configDir: paths.config,
   dataDir: paths.data,
-  browserStateDir: path.join(paths.data, "browser_state"),
-  chromeProfileDir: path.join(paths.data, "chrome_profile"),
-  chromeInstancesDir: path.join(paths.data, "chrome_profile_instances"),
 
   // Library Configuration
   notebookDescription: "General knowledge base",
   notebookTopics: ["General topics"],
   notebookContentTypes: ["documentation", "examples"],
   notebookUseCases: ["General research"],
-
-  // Multi-instance strategy
-  profileStrategy: "auto",
-  cloneProfileOnIsolated: false,
-  cleanupInstancesOnStartup: true,
-  cleanupInstancesOnShutdown: true,
-  instanceProfileTtlHours: 72,
-  instanceProfileMaxCount: 20,
 };
 
 
@@ -169,14 +150,18 @@ function applyEnvOverrides(config: Config): Config {
     ...config,
     // Override with env vars if present
     notebookUrl: process.env.NOTEBOOK_URL || config.notebookUrl,
+    remoteChromeHost: process.env.REMOTE_CHROME_HOST || config.remoteChromeHost,
+    remoteChromePort: parseInteger(process.env.REMOTE_CHROME_PORT, config.remoteChromePort),
+    remoteChromeSecure: parseBoolean(process.env.REMOTE_CHROME_SECURE, config.remoteChromeSecure),
+    remoteChromeWsEndpoint: process.env.REMOTE_CHROME_WS_ENDPOINT || config.remoteChromeWsEndpoint,
+    remoteChromeConnectTimeoutMs: parseInteger(
+      process.env.REMOTE_CHROME_CONNECT_TIMEOUT_MS,
+      config.remoteChromeConnectTimeoutMs
+    ),
     headless: parseBoolean(process.env.HEADLESS, config.headless),
     browserTimeout: parseInteger(process.env.BROWSER_TIMEOUT, config.browserTimeout),
     maxSessions: parseInteger(process.env.MAX_SESSIONS, config.maxSessions),
     sessionTimeout: parseInteger(process.env.SESSION_TIMEOUT, config.sessionTimeout),
-    autoLoginEnabled: parseBoolean(process.env.AUTO_LOGIN_ENABLED, config.autoLoginEnabled),
-    loginEmail: process.env.LOGIN_EMAIL || config.loginEmail,
-    loginPassword: process.env.LOGIN_PASSWORD || config.loginPassword,
-    autoLoginTimeoutMs: parseInteger(process.env.AUTO_LOGIN_TIMEOUT_MS, config.autoLoginTimeoutMs),
     stealthEnabled: parseBoolean(process.env.STEALTH_ENABLED, config.stealthEnabled),
     stealthRandomDelays: parseBoolean(process.env.STEALTH_RANDOM_DELAYS, config.stealthRandomDelays),
     stealthHumanTyping: parseBoolean(process.env.STEALTH_HUMAN_TYPING, config.stealthHumanTyping),
@@ -189,12 +174,6 @@ function applyEnvOverrides(config: Config): Config {
     notebookTopics: parseArray(process.env.NOTEBOOK_TOPICS, config.notebookTopics),
     notebookContentTypes: parseArray(process.env.NOTEBOOK_CONTENT_TYPES, config.notebookContentTypes),
     notebookUseCases: parseArray(process.env.NOTEBOOK_USE_CASES, config.notebookUseCases),
-    profileStrategy: (process.env.NOTEBOOK_PROFILE_STRATEGY as any) || config.profileStrategy,
-    cloneProfileOnIsolated: parseBoolean(process.env.NOTEBOOK_CLONE_PROFILE, config.cloneProfileOnIsolated),
-    cleanupInstancesOnStartup: parseBoolean(process.env.NOTEBOOK_CLEANUP_ON_STARTUP, config.cleanupInstancesOnStartup),
-    cleanupInstancesOnShutdown: parseBoolean(process.env.NOTEBOOK_CLEANUP_ON_SHUTDOWN, config.cleanupInstancesOnShutdown),
-    instanceProfileTtlHours: parseInteger(process.env.NOTEBOOK_INSTANCE_TTL_HOURS, config.instanceProfileTtlHours),
-    instanceProfileMaxCount: parseInteger(process.env.NOTEBOOK_INSTANCE_MAX_COUNT, config.instanceProfileMaxCount),
   };
 }
 
@@ -219,9 +198,6 @@ export const CONFIG: Config = buildConfig();
 export function ensureDirectories(): void {
   const dirs = [
     CONFIG.dataDir,
-    CONFIG.browserStateDir,
-    CONFIG.chromeProfileDir,
-    CONFIG.chromeInstancesDir,
   ];
 
   for (const dir of dirs) {

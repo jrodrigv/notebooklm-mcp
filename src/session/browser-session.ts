@@ -15,7 +15,6 @@
 
 import type { BrowserContext, Page } from "patchright";
 import { SharedContextManager } from "./shared-context-manager.js";
-import { AuthManager } from "../auth/auth-manager.js";
 import { humanType, randomDelay } from "../utils/stealth-utils.js";
 import {
   waitForLatestAnswer,
@@ -24,7 +23,7 @@ import {
 import { CONFIG } from "../config.js";
 import { log } from "../utils/logger.js";
 import type { SessionInfo, ProgressCallback } from "../types.js";
-import { RateLimitError } from "../errors.js";
+import { AuthenticationError, RateLimitError } from "../errors.js";
 
 export class BrowserSession {
   public readonly sessionId: string;
@@ -35,19 +34,19 @@ export class BrowserSession {
 
   private context!: BrowserContext;
   private sharedContextManager: SharedContextManager;
-  private authManager: AuthManager;
   private page: Page | null = null;
   private initialized: boolean = false;
+  private readonly onAuthConfirmed: () => void;
 
   constructor(
     sessionId: string,
     sharedContextManager: SharedContextManager,
-    authManager: AuthManager,
+    onAuthConfirmed: () => void,
     notebookUrl: string
   ) {
     this.sessionId = sessionId;
     this.sharedContextManager = sharedContextManager;
-    this.authManager = authManager;
+    this.onAuthConfirmed = onAuthConfirmed;
     this.notebookUrl = notebookUrl;
     this.createdAt = Date.now();
     this.lastActivity = Date.now();
@@ -96,41 +95,15 @@ export class BrowserSession {
       // Wait for page to stabilize
       await randomDelay(2000, 3000);
 
-      // Check if we need to login
-      const isAuthenticated = await this.authManager.validateCookiesExpiry(
-        this.context
-      );
-
-      if (!isAuthenticated) {
-        log.warning(`  🔑 Session ${this.sessionId} needs authentication`);
-        const loginSuccess = await this.ensureAuthenticated();
-        if (!loginSuccess) {
-          throw new Error("Failed to authenticate session");
-        }
-      } else {
-        log.success(`  ✅ Session already authenticated`);
-      }
-
-      // CRITICAL: Restore sessionStorage from saved state
-      // This is essential for maintaining Google session state!
-      log.info(`  🔄 Restoring sessionStorage...`);
-      const sessionData = await this.authManager.loadSessionStorage();
-      if (sessionData) {
-        const entryCount = Object.keys(sessionData).length;
-        if (entryCount > 0) {
-          await this.restoreSessionStorage(sessionData, entryCount);
-        } else {
-          log.info(`  ℹ️  SessionStorage empty (fresh session)`);
-        }
-      } else {
-        log.info(`  ℹ️  No saved sessionStorage found (fresh session)`);
-      }
+      // Ensure NotebookLM is actually loaded (remote Chrome must already be authenticated)
+      await this.ensureNotebookSession();
 
       // Wait for NotebookLM interface to load
       log.info(`  ⏳ Waiting for NotebookLM interface...`);
       await this.waitForNotebookLMReady();
 
       this.initialized = true;
+      this.onAuthConfirmed?.();
       this.updateActivity();
       log.success(`✅ Session ${this.sessionId} initialized successfully`);
     } catch (error) {
@@ -200,152 +173,28 @@ export class BrowserSession {
     }
   }
 
-  /**
-   * Ensure the session is authenticated, perform auto-login if needed
-   */
-  private async ensureAuthenticated(): Promise<boolean> {
+  private async ensureNotebookSession(): Promise<void> {
     if (!this.page) {
       throw new Error("Page not initialized");
     }
 
-    log.info(`🔑 Checking authentication for session ${this.sessionId}...`);
-
-    // Check cookie validity
-    const isValid = await this.authManager.validateCookiesExpiry(this.context);
-
-    if (isValid) {
-      log.success(`  ✅ Cookies valid`);
-      return true;
-    }
-
-    log.warning(`  ⚠️  Cookies expired or invalid`);
-
-    // Try to get valid auth state
-    const statePath = await this.authManager.getValidStatePath();
-
-    if (statePath) {
-      // Load saved state
-      log.info(`  📂 Loading auth state from: ${statePath}`);
-      await this.authManager.loadAuthState(this.context, statePath);
-
-      // Reload page to apply new auth
-      log.info(`  🔄 Reloading page...`);
-      await (this.page as Page).reload({ waitUntil: "domcontentloaded" });
-      await randomDelay(2000, 3000);
-
-      // Check if it worked
-      const nowValid = await this.authManager.validateCookiesExpiry(
-        this.context
-      );
-      if (nowValid) {
-        log.success(`  ✅ Auth state loaded successfully`);
-        return true;
-      }
-    }
-
-    // Need fresh login
-    log.warning(`  🔑 Fresh login required`);
-
-    if (CONFIG.autoLoginEnabled) {
-      log.info(`  🤖 Attempting auto-login...`);
-      const loginSuccess = await this.authManager.loginWithCredentials(
-        this.context,
-        this.page,
-        CONFIG.loginEmail,
-        CONFIG.loginPassword
-      );
-
-      if (loginSuccess) {
-        log.success(`  ✅ Auto-login successful`);
-        // Navigate back to notebook
-        await this.page.goto(this.notebookUrl, {
-          waitUntil: "domcontentloaded",
-        });
-        await randomDelay(2000, 3000);
-        return true;
-      } else {
-        log.error(`  ❌ Auto-login failed`);
-        return false;
-      }
-    } else {
-      log.error(
-        `  ❌ Auto-login disabled and no valid auth state - manual login required`
-      );
-      return false;
-    }
-  }
-
-  private getOriginFromUrl(url: string): string | null {
-    try {
-      return new URL(url).origin;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Safely restore sessionStorage when the page is on the expected origin
-   */
-  private async restoreSessionStorage(
-    sessionData: Record<string, string>,
-    entryCount: number
-  ): Promise<void> {
-    if (!this.page) {
-      log.warning(`  ⚠️  Cannot restore sessionStorage without an active page`);
+    const currentUrl = this.page.url();
+    if (currentUrl.startsWith("https://notebooklm.google.com/")) {
+      log.success("  ✅ NotebookLM detected");
       return;
     }
 
-    const targetOrigin = this.getOriginFromUrl(this.notebookUrl);
-    if (!targetOrigin) {
-      log.warning(`  ⚠️  Unable to determine target origin for sessionStorage restore`);
-      return;
+    if (currentUrl.includes("accounts.google.com")) {
+      throw new AuthenticationError(
+        "Remote Chrome is not authenticated with Google. Run setup_auth so the Windows Chrome window can complete login.",
+        true
+      );
     }
 
-    let restored = false;
-
-    const applyToPage = async (): Promise<boolean> => {
-      if (!this.page) {
-        return false;
-      }
-
-      const currentOrigin = this.getOriginFromUrl(this.page.url());
-      if (currentOrigin !== targetOrigin) {
-        return false;
-      }
-
-      try {
-        await this.page.evaluate((data) => {
-          for (const [key, value] of Object.entries(data)) {
-            // @ts-expect-error - sessionStorage exists in browser context
-            sessionStorage.setItem(key, value);
-          }
-        }, sessionData);
-        restored = true;
-        log.success(`  ✅ SessionStorage restored: ${entryCount} entries`);
-        return true;
-      } catch (error) {
-        log.warning(`  ⚠️  Failed to restore sessionStorage: ${error}`);
-        return false;
-      }
-    };
-
-    if (await applyToPage()) {
-      return;
-    }
-
-    log.info(`  ⏳ Waiting for NotebookLM origin before restoring sessionStorage...`);
-
-    const handleNavigation = async () => {
-      if (restored) {
-        return;
-      }
-
-      if (await applyToPage()) {
-        this.page?.off("framenavigated", handleNavigation);
-      }
-    };
-
-    this.page.on("framenavigated", handleNavigation);
+    throw new AuthenticationError(
+      `NotebookLM is not accessible from the remote Chrome instance (current URL: ${currentUrl}).`,
+      false
+    );
   }
 
   /**
@@ -361,16 +210,8 @@ export class BrowserSession {
       log.info(`💬 [${this.sessionId}] Asking: "${question.substring(0, 100)}..."`);
       const page = this.page!;
       // Ensure we're still authenticated
-      await sendProgress?.("Verifying authentication...", 2, 5);
-      const isAuth = await this.authManager.validateCookiesExpiry(this.context);
-      if (!isAuth) {
-        log.warning(`  🔑 Session expired, re-authenticating...`);
-        await sendProgress?.("Re-authenticating session...", 2, 5);
-        const reAuthSuccess = await this.ensureAuthenticated();
-        if (!reAuthSuccess) {
-          throw new Error("Failed to re-authenticate session");
-        }
-      }
+      await sendProgress?.("Verifying NotebookLM access...", 2, 5);
+      await this.ensureNotebookSession();
 
       // Snapshot existing responses BEFORE asking
       log.info(`  📸 Snapshotting existing responses...`);
